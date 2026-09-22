@@ -349,3 +349,436 @@ This document defines product behaviour. The technical requirements document wil
 - Frontend pages, API boundaries, and background services
 - Testing, security review, monitoring, and deployment process
 
+---
+
+# Technical Requirements and Architecture
+
+**Status:** Proposed implementation baseline for review
+**Design goal:** Ship a credible, secure testnet DAO without adding infrastructure that the project does not need.
+
+## 17. Architecture Principles
+
+1. **Blockchain decides authority and money.** Eligibility, voting snapshots, vote outcomes, review approval counts, timelocks, role changes, and treasury transfers must be enforced by smart contracts.
+2. **The application makes the DAO usable.** The web application and database help people submit proposals, store private evidence, search history, and read fast dashboards. They must never be the authority that releases funds or changes a vote outcome.
+3. **Use established contracts for standard governance.** The project will build on OpenZeppelin Governor and Timelock modules rather than recreating core vote counting and delayed execution.
+4. **Keep voting power internal and non-transferable.** The DAO will not issue a tradable governance token. Its voting-power registry only records a verified member's weight from 1 to 3.
+5. **Every important decision has an immutable snapshot.** A live vote keeps its membership, voting weights, quorum, vote duration, and proposal terms even if configuration changes later.
+6. **The first release runs only on testnet.** No real-value mainnet treasury is in scope.
+
+## 18. Selected Technology Stack
+
+| Area | Selected technology | Why this is suitable for this project |
+|---|---|---|
+| Web application | React, TypeScript, Vite | React satisfies the project requirement; Vite provides a fast, small React application without introducing Next.js or server-rendering complexity. |
+| UI and client state | Tailwind CSS, shadcn/ui, React Router, TanStack Query | Gives consistent accessible UI, client routing, and reliable server/cache state with a small learning curve. |
+| Forms and validation | React Hook Form and Zod | Validates grant forms before upload and uses the same schema concepts at the API boundary. |
+| Wallet connection | wagmi and viem | React-friendly wallet state and type-safe EVM contract reads, writes, and event decoding. |
+| Smart contracts | Solidity, Foundry, OpenZeppelin Contracts | Foundry gives fast Solidity testing and deployment scripts; OpenZeppelin provides maintained governance, timelock, access-control, and security primitives. |
+| Governance custody | OpenZeppelin `Governor` and `TimelockController`; Safe 3-of-5 multisig | Separates Council voting, delayed execution, and protected administrator operations. |
+| Backend services | Supabase Edge Functions, TypeScript | Avoids a separate always-running Node server for version 1 while keeping privileged operations off the browser. |
+| Database | Supabase PostgreSQL | Managed relational data, migrations, backups, Row Level Security, and a natural fit for proposal and review records. |
+| Private evidence storage | Supabase Storage private bucket | Stores sensitive documents outside the blockchain with signed, time-limited access. |
+| Chain and currency | Ethereum Sepolia and test ETH | Widely supported test network, familiar wallet tooling, and no real-value treasury in the first release. |
+| RPC access | Managed Sepolia RPC provider behind a provider adapter | Reliable reads and log polling without coupling the application to a single provider. |
+| Hosting | Vercel static deployment for the React application; Supabase for data and functions | Low operational overhead and independent deploys for web and backend. |
+| Monitoring | Sentry for browser and Edge Function errors; database event-indexer health record | Detects user-facing failures and stale chain indexing early. |
+| CI | GitHub Actions | Runs formatting, unit tests, contract tests, static analysis, and production builds on every pull request. |
+
+The selected components are deliberately conventional. The project should demonstrate correct use of each component rather than create custom alternatives for routine problems.
+
+## 19. High-Level Architecture
+
+```mermaid
+flowchart TB
+    U[Applicant, Council Member, Reviewer, or Admin Signer]
+    W[React + TypeScript + Vite web application]
+    WALLET[Wallet via wagmi + viem]
+    API[Supabase Edge Functions]
+    DB[(Supabase PostgreSQL)]
+    STORAGE[Private evidence storage]
+    INDEXER[Scheduled chain event indexer]
+    RPC[Sepolia RPC provider]
+    GOV[CommunityGovernor]
+    POWER[VotingPowerRegistry]
+    GRANTS[GrantRegistry]
+    TIMELOCK[TimelockController]
+    VAULT[TreasuryVault]
+    SAFE[Admin Safe: 3 of 5]
+
+    U --> W
+    W --> WALLET
+    W --> API
+    API --> DB
+    API --> STORAGE
+    INDEXER --> RPC
+    INDEXER --> DB
+    WALLET --> GOV
+    WALLET --> GRANTS
+    GOV --> POWER
+    GOV --> TIMELOCK
+    TIMELOCK --> GRANTS
+    TIMELOCK --> VAULT
+    SAFE --> POWER
+    SAFE --> GRANTS
+    SAFE --> TIMELOCK
+```
+
+### Trust boundaries
+
+- The **wallet** signs the user's on-chain vote, proposal, or review transaction.
+- The **smart contracts** enforce the authoritative business rules.
+- The **database** is a read model and workflow store. It never determines whether money can move.
+- The **Edge Functions** validate signed requests, store permitted off-chain data, issue private upload/download URLs, and index blockchain events.
+- The **Admin Safe** can make only the specific protected configuration and emergency calls granted to it by contracts.
+
+## 20. Smart Contract Design
+
+The contract system uses OpenZeppelin's Governor foundation. OpenZeppelin documents `GovernorVotes` for snapshot-based voting power and `GovernorTimelockControl` with `TimelockController` for delayed execution. [OpenZeppelin governance documentation](https://docs.openzeppelin.com/contracts/5.x/governance)
+
+### 20.1 Contract responsibilities
+
+| Contract | Responsibility | Privileged caller(s) |
+|---|---|---|
+| `VotingPowerRegistry` | Stores active membership, Reviewer status, and the non-transferable voting weight from 1 to 3. Provides historical vote checkpoints to the Governor. | Timelock for Council-approved role changes; Admin Safe only for tightly scoped, future-facing policy configuration |
+| `GrantRegistry` | Stores the on-chain identity of each grant: applicant, recipient wallet, requested amount, evidence reference hash, Reviewer decisions, and lifecycle status. | Reviewers submit their own review; Timelock applies approved lifecycle transitions |
+| `CommunityGovernor` | Creates, tracks, and counts Council governance proposals. Uses historical voting power and snapshot quorum. | Public proposal creation subject to the configured threshold; no operator can alter a cast vote |
+| `TimelockController` | Queues successful Governor actions and enforces the payment delay. | Governor schedules; anyone may execute a ready, valid operation |
+| `TreasuryVault` | Holds test ETH and releases the exact amount to an approved recipient only through a valid timelocked action. Can be paused. | Timelock for payment; Admin Safe for a limited pause only |
+| `DAOConfig` | Holds versioned, bounded future configuration values. | Admin Safe with 3 of 5 signatures |
+
+### 20.2 Voting-power implementation
+
+`VotingPowerRegistry` is a custom non-transferable implementation of OpenZeppelin's `IVotes` interface. It is an internal accounting registry, not an ERC-20 or a user-traded token.
+
+- An active Council Member has base weight `1`.
+- The registry can add one verified community-contribution point and one verified treasury-contribution point.
+- Contract validation prevents a weight below `0` or above `3`.
+- Transfers, delegation, approvals, and trading are not implemented.
+- The registry checkpoints both each wallet's weight and the total eligible voting weight by block number.
+- `CommunityGovernor` reads the checkpoint at the vote snapshot, so changes after voting begins cannot affect that vote.
+
+This preserves the agreed 1-to-3 model without pretending that internal voting weight is a financial asset.
+
+### 20.3 Governance proposal types
+
+The same Governor handles the action types below. Each proposal contains the exact target contract call that will execute if the vote passes.
+
+| Proposal type | Timelocked action |
+|---|---|
+| Grant approval | `GrantRegistry` marks the reviewed grant approved and `TreasuryVault` sends the exact approved test ETH amount |
+| Member admission | `VotingPowerRegistry` activates the admitted wallet at base weight 1 |
+| Member or Reviewer removal | `VotingPowerRegistry` deactivates the role or membership |
+| Reviewer election | `VotingPowerRegistry` grants Reviewer status with its term end time |
+| Admin Signer replacement | A controlled Safe-owner change transaction is prepared and executed only after the protected governance path succeeds |
+
+An Eligible Council Member sponsors an on-chain proposal. For a public grant, the sponsoring member must be one of the Reviewers who approved the grant or another Council Member acting from the completed public review record. The Governor accepts a grant action only when the `GrantRegistry` proves that the required 2-of-3 review approval exists.
+
+### 20.4 Vote and configuration snapshots
+
+OpenZeppelin Governor already snapshots voting power. This project adds a small custom configuration-snapshot extension because the functional rules require Admin configuration to affect future proposals only.
+
+When a proposal is created, `CommunityGovernor` stores:
+
+- Voting-power snapshot block
+- Total-weight quorum denominator
+- Quorum percentage
+- Vote start and deadline
+- Configuration version identifier
+- For grants: recipient wallet, exact amount, grant identifier, and review approval state
+
+`DAOConfig` changes the active configuration only for later proposals. It cannot rewrite an existing proposal's stored values.
+
+### 20.5 Timelock and treasury protection
+
+- The contract minimum delay is **48 hours** in version 1.
+- A successful grant is queued through `TimelockController`; it becomes executable only after its recorded delay has elapsed.
+- Any wallet may execute a ready timelocked operation. This prevents an unavailable admin from blocking a valid approved payment.
+- `TreasuryVault` accepts a payment only from the Timelock and only for an approved, unexecuted grant.
+- The vault records a grant as executed before the external ETH transfer, uses reentrancy protection, and rejects a duplicate payment.
+- The Admin Safe can pause the vault for at most seven days. It cannot transfer funds or create a payment.
+
+The Admin Safe may configure future policy values through `DAOConfig`, but it cannot reduce the contract-enforced minimum payment delay below 48 hours. This is an intentional safety floor.
+
+### 20.6 Admin Safe integration
+
+Deploy one [Safe Smart Account](https://docs.safe.global/advanced/smart-account-overview) with five independent owners and a threshold of three confirmations.
+
+- The Safe is the holder of narrowly scoped administrator roles.
+- The Safe Transaction Service is used for the Signers to propose and collect approvals for configuration or emergency actions.
+- Safe does not own the treasury and cannot call arbitrary treasury transfers.
+- Contract roles grant the Safe only `CONFIG_MANAGER_ROLE` and `EMERGENCY_PAUSER_ROLE` as needed.
+- Council-approved membership and role changes are executed through the Governor and Timelock, not as discretionary Safe calls.
+
+This contract-enforced division is stronger than asking Signers to manually respect a policy.
+
+### 20.7 On-chain data limits
+
+Contracts store only data needed for authority and audit:
+
+- Wallet addresses, role status, voting checkpoints, and role term end
+- Grant identifier, recipient wallet, requested amount, lifecycle state, and evidence hash/reference
+- Reviewer decisions and non-sensitive reason hash/reference
+- Proposal identifiers, vote results, snapshot data, and execution state
+
+Long descriptions, files, identity documents, and private evidence stay off-chain. The contract stores a content hash or immutable reference so the reviewed version can be verified later.
+
+## 21. Web Application Design
+
+### 21.1 Application pages
+
+| Route | User need |
+|---|---|
+| `/` | DAO purpose, treasury balance, current activity, and clear call to submit or participate |
+| `/grants` | Search, filter, and browse grants by status and category |
+| `/grants/new` | Guided public proposal form with evidence upload |
+| `/grants/:id` | Full proposal, public evidence references, Reviewer outcome, vote details, timelock, and transfer record |
+| `/governance` | Active and past Council proposals, vote deadlines, quorum progress, and vote action |
+| `/membership` | Member application, endorsements, application status, and member directory |
+| `/reviewer` | Reviewer applications, assigned review queue, conflict declaration, and review decision form |
+| `/admin` | Safe transaction links, current configuration, configuration history, emergency-pause status, and restricted admin actions |
+| `/activity` | Event timeline built from indexed on-chain events |
+
+### 21.2 Frontend responsibilities
+
+- Connect the user's wallet and verify the Sepolia network.
+- Read authoritative contract state using wagmi and viem.
+- Submit transactions directly from the user's wallet; the browser never handles private keys.
+- Use the backend for private uploads, readable search, server-verified signed requests, and indexed history.
+- Show transaction state clearly: wallet signature requested, transaction submitted, pending confirmation, confirmed, or failed.
+- Link every transaction to a block explorer.
+- Fall back to direct contract reads if the indexed database is behind.
+
+### 21.3 Client-side quality rules
+
+- TypeScript strict mode is enabled.
+- Contract addresses and ABI versions are generated from deployment artifacts rather than copied by hand.
+- Forms use Zod validation before submission and API validation repeats it on the server.
+- The UI never calculates an authoritative quorum, eligibility result, or execution permission by itself; it displays contract reads.
+- Accessibility includes semantic form labels, keyboard navigation, visible transaction status, and readable error messages.
+
+## 22. Backend and Service Design
+
+Supabase Edge Functions provide the small server-side boundary needed by version 1. They are not a substitute for the contracts; they handle data that should not be public or trusted to a browser.
+
+### 22.1 Edge Functions
+
+| Function | Responsibility |
+|---|---|
+| `auth-challenge` | Creates a one-time, short-lived wallet-signature nonce. |
+| `auth-verify` | Verifies the signed wallet login message, consumes the nonce, and creates a short-lived application session. |
+| `proposal-draft` | Validates and persists off-chain proposal text and metadata before the applicant submits the matching on-chain grant transaction. |
+| `evidence-upload-url` | Verifies the applicant or assigned Reviewer and returns a short-lived signed upload URL for a private file. |
+| `evidence-download-url` | Authorizes a Reviewer, applicant, or permitted admin workflow and returns a short-lived signed download URL. |
+| `chain-indexer` | Runs on a schedule, fetches finalized contract logs, deduplicates them, updates read models, and records its sync cursor. |
+| `safe-transaction-link` | Creates safe, validated links or metadata for a permitted Safe configuration action; it does not sign or execute it. |
+
+### 22.2 Authentication and authorization
+
+- The application uses wallet-signature login based on a nonce, domain, chain ID, issued time, expiry time, and statement of intent.
+- A nonce is single-use and expires quickly, preventing replay.
+- The backend resolves roles from indexed on-chain state. It never trusts a browser-supplied role claim.
+- Sensitive actions require both an authenticated wallet session and the relevant on-chain role.
+- Direct public writes to database tables are disabled. Edge Functions perform validated writes with server credentials.
+
+### 22.3 Chain event indexing
+
+Blockchain events are the source of truth, while PostgreSQL is a searchable projection.
+
+The scheduled indexer:
+
+1. Reads events only after a configurable finality buffer.
+2. Stores a durable block cursor.
+3. Inserts raw events idempotently using the tuple `(chain_id, transaction_hash, log_index)` as the unique key.
+4. Updates normalized proposal, membership, vote, and treasury read models in the same database transaction.
+5. Rewinds and rebuilds the unfinalized range if a block-hash mismatch indicates a chain reorganization.
+6. Records last processed block, last successful run, and lag so the dashboard can report stale data.
+
+The frontend can read the relevant contract directly when an indexed record is missing or stale.
+
+## 23. Database and Storage Design
+
+### 23.1 PostgreSQL is used for off-chain workflow data
+
+PostgreSQL is appropriate because the system contains related entities, status transitions, audit records, and permission-sensitive documents. It also supports clear migrations and indexes for the common query patterns.
+
+| Table / read model | Primary purpose |
+|---|---|
+| `wallet_profiles` | Public profile data keyed by normalized wallet address |
+| `wallet_login_nonces` | Single-use authentication nonces with expiry and consumption time |
+| `grant_drafts` | Editable off-chain proposal content before or alongside on-chain submission |
+| `grant_documents` | Private or public file metadata, content hash, storage key, and visibility |
+| `membership_applications` | Identity verification outcome, endorsements, and application status; no raw identity document |
+| `review_assignments` | Off-chain workflow view of the three assigned Reviewers and conflict status |
+| `chain_events` | Immutable indexed contract-event ledger |
+| `grant_read_models` | Query-friendly grant state projected from events |
+| `governance_read_models` | Query-friendly proposal and vote state projected from events |
+| `configuration_history` | Indexed configuration versions and Safe transaction references |
+| `indexer_state` | Finalized cursor, block hash, lag, and last successful run |
+| `audit_log` | Backend workflow actions such as signed-URL issuance and administrative request creation |
+
+### 23.2 Database rules
+
+- Use UUID primary keys for off-chain records and `chain_id + contract_address + on_chain_id` unique keys for blockchain entities.
+- Store money as integer base units or numeric strings; never JavaScript floating-point numbers.
+- Store wallet addresses normalized to lowercase for lookup while preserving checksum format for display.
+- Add indexes for grant status and creation time, reviewer assignment and status, proposal snapshot block, event block number, and document ownership.
+- Use foreign keys for relationships that exist entirely off-chain. Never assume a database row proves an on-chain action.
+- Use append-only events and audit records for traceability; read models may be rebuilt from those events.
+
+### 23.3 Row Level Security and storage access
+
+Every exposed table has Row Level Security enabled. Browser clients receive only public, read-only data where direct reads are necessary. Private evidence, membership verification results, and administrative workflow records remain server-mediated.
+
+- The Supabase service-role key exists only in Edge Function secrets.
+- Private evidence uses a non-public storage bucket.
+- Upload and download access uses short-lived signed URLs after a server-side role and ownership check.
+- Sensitive files are malware-scanned before review access is granted.
+- Public descriptions may be exposed, but identity documents must never be placed in a public bucket or contract event.
+
+These rules follow Supabase's guidance to enable RLS on exposed tables and to keep service-role credentials out of client applications. [Supabase security guidance](https://supabase.com/docs/guides/security/product-security)
+
+## 24. Data Ownership and Source of Truth
+
+| Data | Source of truth | Database role |
+|---|---|---|
+| Member status, Reviewer status, voting weight | `VotingPowerRegistry` | Indexed display and query cache |
+| Vote snapshot, cast votes, quorum, outcome | `CommunityGovernor` | Indexed display and analytics |
+| Review approval count and grant execution status | `GrantRegistry` and `TreasuryVault` | Indexed display and work queue |
+| Treasury balance and transfer | Sepolia chain and `TreasuryVault` | Cached dashboard value and transaction link |
+| Proposal description and documents | PostgreSQL and Storage, hash anchored on-chain | Workflow source; contract reference proves reviewed version |
+| Private identity documents | Private Storage only | Access metadata and verification outcome only |
+| Admin Safe confirmations | Safe and Safe Transaction Service | Read-only link and status projection |
+
+## 25. Security Design
+
+### 25.1 Contract security controls
+
+- Use current OpenZeppelin contracts for `Governor`, `TimelockController`, `AccessControl`, `Pausable`, and `ReentrancyGuard`.
+- Apply least-privilege roles; no deployer wallet remains a permanent privileged owner.
+- Put treasury custody behind the Timelock, with no external method for arbitrary ETH transfer.
+- Validate every recipient address, amount, status transition, Reviewer assignment, 2-of-3 review condition, and one-time grant execution.
+- Store configuration versions and proposal snapshots so a future setting cannot rewrite a live decision.
+- Prefer direct calls to audited contracts. Do not add Safe modules in version 1 because modules create a separate critical-security surface.
+- Verify all contracts on the Sepolia block explorer after deployment.
+
+### 25.2 Application security controls
+
+- Validate all request bodies with Zod on the server.
+- Rate-limit public submission, nonce, and signed-URL endpoints.
+- Use Content Security Policy, HTTPS, secure headers, and a restrictive CORS allow-list.
+- Never expose RPC, Supabase service-role, Safe API, or monitoring secrets to the browser.
+- Sanitize rich text and render submitted links safely.
+- Log administrative attempts, evidence access, and failed authorization checks without logging sensitive document content.
+
+### 25.3 Operational safeguards
+
+- Use separate local, testnet, and production-like environment variables.
+- Store deployer and Safe signer keys only in wallets or a protected secret manager, never in the repository.
+- Set spending and testnet funding limits for the first deployment.
+- Keep a written emergency runbook: pause reason, maximum seven-day duration, Council review, and unpause/cancel process.
+
+## 26. Repository Structure
+
+Use a small pnpm workspace monorepo so contracts and web application share typed deployment data without forcing a large microservice setup.
+
+```text
+community_treasury_DAO/
+├── apps/
+│   └── web/                 # React + Vite client
+├── contracts/
+│   ├── src/                 # Solidity contracts
+│   ├── test/                # Foundry unit, fuzz, and invariant tests
+│   ├── script/              # Deploy and role-configuration scripts
+│   └── deployments/         # Chain-specific addresses and ABI exports
+├── supabase/
+│   ├── functions/           # Edge Functions
+│   ├── migrations/          # PostgreSQL migrations
+│   └── seed.sql             # Local development seed data only
+├── packages/
+│   ├── contract-client/     # Generated ABIs, addresses, and typed helpers
+│   └── shared-schemas/      # Zod schemas shared by web and functions
+├── docs/
+├── .github/workflows/
+└── pnpm-workspace.yaml
+```
+
+## 27. Environments and Deployment
+
+| Environment | Purpose | Chain | Data |
+|---|---|---|---|
+| Local | Fast development and automated tests | Anvil | Local PostgreSQL/Storage emulator or isolated Supabase project |
+| Testnet | Demonstrable end-to-end DAO | Sepolia | Dedicated Supabase project and test files |
+| Production | Deferred until a separate security review | No real-value deployment in version 1 | Separate accounts, keys, and backups |
+
+### Deployment order
+
+1. Deploy and test `VotingPowerRegistry`, `DAOConfig`, `GrantRegistry`, `TreasuryVault`, Timelock, and Governor locally.
+2. Deploy the Safe with five owner wallets and 3-of-5 threshold.
+3. Grant the narrow contract roles, transfer contract administration to the intended Timelock/Safe owners, and revoke deployer privileges.
+4. Export addresses and ABIs to `packages/contract-client`.
+5. Deploy database migrations, storage policies, and Edge Functions.
+6. Configure the event indexer with contract addresses and a finalized start block.
+7. Deploy the React application with its public chain, contract-address, Supabase URL, and RPC configuration.
+8. Run the end-to-end acceptance flow on Sepolia before sharing the application.
+
+## 28. Testing and Quality Gates
+
+### Smart contract tests
+
+- Unit tests for each lifecycle transition and role boundary.
+- Fuzz tests for voting weight updates, membership changes, proposal amounts, and duplicate execution attempts.
+- Invariant tests proving that voting weight never exceeds 3, a grant transfers at most once, and no payment occurs before the timelock.
+- Integration tests for Reviewer approval, Governor vote, Timelock queue, and treasury execution.
+- Static analysis with Slither and compiler warnings treated as failures.
+
+### Backend and database tests
+
+- Test Edge Functions for nonce replay, unauthorized uploads, expired signed URLs, role checks, and malformed inputs.
+- Run migrations in an isolated database during CI.
+- Test event idempotency, finalized-log processing, and read-model rebuild from raw events.
+- Verify RLS policies with allowed and denied database-client scenarios.
+
+### Frontend tests
+
+- Unit tests for form validation and transaction-state components.
+- Component tests for role-aware pages and accessibility basics.
+- Playwright end-to-end test covering proposal submission, Reviewer screen, vote display, and transaction links using test wallets or mocked contract clients.
+- Production build, lint, typecheck, and dependency audit in CI.
+
+## 29. Version 1 Implementation Sequence
+
+1. Scaffold the pnpm workspace, React/Vite application, Foundry contracts, and Supabase local configuration.
+2. Implement `VotingPowerRegistry` with tests for membership, capped weights, and checkpoints.
+3. Implement `GrantRegistry` and Reviewer-panel rules with lifecycle tests.
+4. Compose and test the OpenZeppelin Governor and Timelock with the 30% quorum and seven-day vote duration.
+5. Implement `TreasuryVault` and prove one-time, delayed test-ETH transfer behaviour.
+6. Deploy a local Safe and wire its restricted Admin roles.
+7. Add PostgreSQL migrations, private evidence storage, signed wallet authentication, and event indexing.
+8. Build the public grant, review, governance, membership, and activity pages.
+9. Deploy to Sepolia and complete a documented end-to-end test scenario.
+10. Run security checks, prepare a README architecture diagram, and record deployment addresses and test results for the portfolio.
+
+## 30. Explicit Technical Decisions
+
+| Decision | Chosen approach |
+|---|---|
+| Frontend framework | React with TypeScript and Vite; no Next.js |
+| Backend shape | Supabase Edge Functions instead of a separate Node server |
+| Database | Supabase PostgreSQL with RLS and migrations |
+| File storage | Supabase private bucket with signed URLs |
+| Chain | Ethereum Sepolia for the complete version 1 project |
+| Governance base | OpenZeppelin Governor, `IVotes` snapshots, and TimelockController |
+| Voting weight | Custom internal, non-transferable, checkpointed 1-to-3 registry |
+| Admin authority | 3-of-5 Safe with narrow contract roles |
+| Treasury custody | Dedicated vault controlled by Timelock, never by an individual Admin wallet |
+| Event data | Contract events are authoritative; PostgreSQL is an indexed read model |
+| Contract development | Foundry, Solidity, OpenZeppelin, Slither, and Sepolia verification |
+| Hosting | Vercel for the React static site and Supabase for backend services |
+
+## 31. Technical References
+
+- [OpenZeppelin governance and Governor modules](https://docs.openzeppelin.com/contracts/5.x/governance)
+- [OpenZeppelin Timelock and access-control guidance](https://docs.openzeppelin.com/contracts/5.x/access-control)
+- [Safe Smart Account overview](https://docs.safe.global/advanced/smart-account-overview)
+- [Vite React templates and setup](https://vite.dev/guide/)
+- [Supabase product-security guidance](https://supabase.com/docs/guides/security/product-security)
